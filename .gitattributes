@@ -1,2 +1,287 @@
-# Auto detect text files and perform LF normalization
-* text=auto
+
+import time
+import warnings
+from datetime import datetime
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.gridspec import GridSpec
+import yfinance as yf
+from sklearn.ensemble import GradientBoostingClassifier
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.metrics import accuracy_score, roc_auc_score
+
+warnings.filterwarnings("ignore")
+
+# %% Configurações
+TICKERS = ["PETR4.SA", "VALE3.SA", "ITUB4.SA", "BBDC4.SA", "^BVSP"]  # mude à vontade
+ATIVO = TICKERS[0]            # ativo analisado em detalhe
+PERIODO_HIST = "5y"           # histórico para treinar o modelo
+INTERVALO_LIVE = "5m"         # candle intradiário
+REFRESH_SEG = 60              # atualização do dashboard
+RETREINO_SEG = 3600           # re-treino do modelo (1 h)
+CUSTO = 0.0005                # custo por troca de posição no backtest (0,05%)
+LIMIAR_COMPRA, LIMIAR_VENDA = 0.55, 0.45
+LOG_CSV = Path("previsoes_log.csv")
+
+FEATURES = [
+    "ret", "ret_l1", "ret_l2", "ret_l3", "ret_l5",
+    "dist_sma10", "dist_sma20", "dist_sma50",
+    "rsi", "macd", "macd_hist", "bb_pct", "atr_pct", "vol20", "vol_chg",
+]
+
+
+# %% Dados e indicadores
+def baixar(ticker, periodo, intervalo="1d"):
+    df = yf.download(ticker, period=periodo, interval=intervalo,
+                     auto_adjust=True, progress=False)
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    return df.dropna()
+
+
+def indicadores(df):
+    d = df.copy()
+    c = d["Close"]
+    d["ret"] = c.pct_change()
+    for n in (1, 2, 3, 5):
+        d[f"ret_l{n}"] = d["ret"].shift(n)
+    for n in (10, 20, 50):
+        d[f"sma{n}"] = c.rolling(n).mean()
+        d[f"dist_sma{n}"] = c / d[f"sma{n}"] - 1
+
+    # MACD
+    ema12, ema26 = c.ewm(span=12).mean(), c.ewm(span=26).mean()
+    d["macd"] = ema12 - ema26
+    d["macd_sig"] = d["macd"].ewm(span=9).mean()
+    d["macd_hist"] = d["macd"] - d["macd_sig"]
+
+    # RSI
+    delta = c.diff()
+    ganho = delta.clip(lower=0).ewm(alpha=1 / 14).mean()
+    perda = (-delta.clip(upper=0)).ewm(alpha=1 / 14).mean()
+    d["rsi"] = 100 - 100 / (1 + ganho / perda)
+
+    # Bandas de Bollinger
+    std20 = c.rolling(20).std()
+    d["bb_up"] = d["sma20"] + 2 * std20
+    d["bb_lo"] = d["sma20"] - 2 * std20
+    d["bb_pct"] = (c - d["bb_lo"]) / (d["bb_up"] - d["bb_lo"])
+
+    # ATR e volatilidade
+    pc = c.shift()
+    tr = pd.concat([d["High"] - d["Low"], (d["High"] - pc).abs(),
+                    (d["Low"] - pc).abs()], axis=1).max(axis=1)
+    d["atr_pct"] = tr.rolling(14).mean() / c
+    d["vol20"] = d["ret"].rolling(20).std() * np.sqrt(252)
+    d["vol_chg"] = d["Volume"].pct_change().replace([np.inf, -np.inf], np.nan)
+    return d
+
+
+# %% Modelo
+def novo_modelo():
+    return GradientBoostingClassifier(n_estimators=200, max_depth=3,
+                                      learning_rate=0.05, subsample=0.8,
+                                      random_state=42)
+
+
+def treinar():
+    """Treina com validação walk-forward e gera backtest fora da amostra."""
+    d = indicadores(baixar(ATIVO, PERIODO_HIST))
+    d["fut"] = d["Close"].pct_change().shift(-1)        # retorno do dia seguinte
+    d = d.dropna(subset=FEATURES + ["fut"])
+    X, y = d[FEATURES], (d["fut"] > 0).astype(int)
+
+    prob = pd.Series(np.nan, index=d.index)
+    accs, aucs = [], []
+    for tr, te in TimeSeriesSplit(5).split(X):
+        m = novo_modelo().fit(X.iloc[tr], y.iloc[tr])
+        p = m.predict_proba(X.iloc[te])[:, 1]
+        prob.iloc[te] = p
+        accs.append(accuracy_score(y.iloc[te], p > 0.5))
+        aucs.append(roc_auc_score(y.iloc[te], p))
+
+    oos = d.loc[prob.notna(), ["fut"]].copy()
+    oos["prob"] = prob.dropna()
+    pos = (oos["prob"] > 0.5).astype(int)
+    custo = pos.diff().abs().fillna(0) * CUSTO
+    ret_est = pos * oos["fut"] - custo
+    oos["estrategia"] = (1 + ret_est).cumprod()
+    oos["buyhold"] = (1 + oos["fut"]).cumprod()
+    sharpe = ret_est.mean() / ret_est.std() * np.sqrt(252) if ret_est.std() else 0
+
+    # correlação entre os ativos monitorados
+    rets = {}
+    for t in TICKERS:
+        try:
+            rets[t] = baixar(t, "1y")["Close"].pct_change()
+        except Exception:
+            pass
+    corr = pd.DataFrame(rets).corr()
+
+    return {
+        "modelo": novo_modelo().fit(X, y), "acc": np.mean(accs),
+        "auc": np.mean(aucs), "oos": oos, "sharpe": sharpe, "corr": corr,
+    }
+
+
+def prever(modelo, df_dia):
+    x = indicadores(df_dia).iloc[[-1]][FEATURES]
+    return float(modelo.predict_proba(x)[0, 1])
+
+
+# %% Gráficos
+def candles(ax, d):
+    x = np.arange(len(d))
+    cor = np.where(d["Close"] >= d["Open"], "#2ca02c", "#d62728")
+    ax.vlines(x, d["Low"], d["High"], color=cor, lw=0.8)
+    ax.bar(x, (d["Close"] - d["Open"]).abs(), bottom=d[["Open", "Close"]].min(axis=1),
+           color=cor, width=0.7)
+    return x
+
+
+def datas(ax, idx, n=6):
+    pos = np.linspace(0, len(idx) - 1, n).astype(int)
+    ax.set_xticks(pos)
+    ax.set_xticklabels([idx[i].strftime("%d/%m/%y") for i in pos], fontsize=8)
+
+
+def criar_figura():
+    fig = plt.figure(figsize=(16, 10), constrained_layout=True)
+    gs = GridSpec(4, 3, figure=fig, height_ratios=[3, 1, 1.2, 1.2])
+    ax = {
+        "preco": fig.add_subplot(gs[0, :2]),
+        "live": fig.add_subplot(gs[0, 2]),
+        "vol": fig.add_subplot(gs[1, :2]),
+        "prob": fig.add_subplot(gs[1, 2]),
+        "rsi": fig.add_subplot(gs[2, :2]),
+        "eq": fig.add_subplot(gs[2:, 2]),
+        "macd": fig.add_subplot(gs[3, :2]),
+    }
+    return fig, ax
+
+
+def desenhar(fig, ax, hist, live, prob, est):
+    for a in ax.values():
+        a.clear()
+    d = hist.tail(120)
+    x = np.arange(len(d))
+
+    # Preço + médias + Bollinger
+    candles(ax["preco"], d)
+    ax["preco"].plot(x, d["sma20"], label="SMA20", lw=1.2)
+    ax["preco"].plot(x, d["sma50"], label="SMA50", lw=1.2)
+    ax["preco"].fill_between(x, d["bb_lo"], d["bb_up"], alpha=0.12, color="gray",
+                             label="Bollinger")
+    ax["preco"].set_title(f"{ATIVO} | candles diários (120d)", loc="left")
+    ax["preco"].legend(loc="upper left", fontsize=8, ncol=3)
+    ax["preco"].grid(alpha=0.2)
+    datas(ax["preco"], d.index)
+
+    # Intradiário
+    if len(live):
+        ax["live"].plot(live.index, live["Close"], lw=1.2)
+        ax["live"].fill_between(live.index, live["Close"], live["Close"].min(), alpha=0.15)
+        ax["live"].set_title(f"Intradiário ({INTERVALO_LIVE}) | último: {live['Close'].iloc[-1]:.2f}",
+                             loc="left")
+        ax["live"].tick_params(axis="x", labelsize=7, rotation=30)
+    ax["live"].grid(alpha=0.2)
+
+    # Volume
+    cor = np.where(d["Close"] >= d["Open"], "#2ca02c", "#d62728")
+    ax["vol"].bar(x, d["Volume"], color=cor, width=0.7)
+    ax["vol"].set_title("Volume", loc="left", fontsize=9)
+    datas(ax["vol"], d.index)
+
+    # Probabilidade de alta
+    sinal = "COMPRA" if prob > LIMIAR_COMPRA else "VENDA" if prob < LIMIAR_VENDA else "NEUTRO"
+    cor_s = {"COMPRA": "#2ca02c", "VENDA": "#d62728", "NEUTRO": "#888888"}[sinal]
+    ax["prob"].barh([0], [prob], color=cor_s, height=0.5)
+    ax["prob"].barh([0], [1 - prob], left=[prob], color="#dddddd", height=0.5)
+    ax["prob"].axvline(0.5, color="k", lw=1, ls="--")
+    ax["prob"].set_xlim(0, 1)
+    ax["prob"].set_yticks([])
+    ax["prob"].set_title(f"P(alta amanhã) = {prob:.1%}  →  {sinal}", color=cor_s, fontsize=11)
+    ax["prob"].set_xlabel(f"Walk-forward: acc {est['acc']:.1%} | AUC {est['auc']:.3f}", fontsize=8)
+
+    # RSI
+    ax["rsi"].plot(x, d["rsi"], color="purple", lw=1.2)
+    ax["rsi"].axhline(70, color="r", ls="--", lw=0.8)
+    ax["rsi"].axhline(30, color="g", ls="--", lw=0.8)
+    ax["rsi"].set_ylim(0, 100)
+    ax["rsi"].set_title("RSI(14)", loc="left", fontsize=9)
+    datas(ax["rsi"], d.index)
+
+    # MACD
+    ax["macd"].plot(x, d["macd"], label="MACD", lw=1.1)
+    ax["macd"].plot(x, d["macd_sig"], label="Sinal", lw=1.1)
+    ax["macd"].bar(x, d["macd_hist"], color=np.where(d["macd_hist"] >= 0, "#2ca02c", "#d62728"),
+                   alpha=0.5)
+    ax["macd"].legend(fontsize=7, loc="upper left")
+    ax["macd"].set_title("MACD", loc="left", fontsize=9)
+    datas(ax["macd"], d.index)
+
+    # Backtest
+    oos = est["oos"]
+    ax["eq"].plot(oos.index, oos["estrategia"], label="Estratégia (modelo)", lw=1.5)
+    ax["eq"].plot(oos.index, oos["buyhold"], label="Buy & Hold", lw=1.2, alpha=0.8)
+    ax["eq"].set_title(f"Backtest fora da amostra | Sharpe {est['sharpe']:.2f}", loc="left", fontsize=10)
+    ax["eq"].legend(fontsize=8)
+    ax["eq"].grid(alpha=0.2)
+
+    # Correlação (inset no painel de backtest)
+    corr = est["corr"]
+    ins = ax["eq"].inset_axes([0.05, 0.02, 0.45, 0.35])
+    ins.imshow(corr.values, cmap="RdYlGn", vmin=-1, vmax=1)
+    ins.set_xticks(range(len(corr)))
+    ins.set_yticks(range(len(corr)))
+    ins.set_xticklabels([c.replace(".SA", "") for c in corr.columns], rotation=90, fontsize=5)
+    ins.set_yticklabels([c.replace(".SA", "") for c in corr.index], fontsize=5)
+    ins.set_title("Correlação", fontsize=6)
+
+    fig.suptitle(f"Monitor de Ações | atualizado {datetime.now():%d/%m/%Y %H:%M:%S}",
+                 fontsize=13, fontweight="bold")
+    fig.canvas.draw_idle()
+
+
+def registrar(prob, preco):
+    linha = pd.DataFrame([{"momento": datetime.now().isoformat(timespec="seconds"),
+                           "ativo": ATIVO, "preco": preco, "prob_alta": round(prob, 4)}])
+    linha.to_csv(LOG_CSV, mode="a", header=not LOG_CSV.exists(), index=False)
+
+
+# %% Loop contínuo
+def executar():
+    try:  # no Spyder, força janela interativa
+        get_ipython().run_line_magic("matplotlib", "qt")  # noqa: F821
+    except Exception:
+        pass
+    plt.ion()
+    fig, ax = criar_figura()
+    est, t_treino = None, 0.0
+    print(f"Monitorando {ATIVO}. Feche a janela do gráfico para encerrar.")
+
+    while plt.fignum_exists(fig.number):
+        try:
+            if est is None or time.time() - t_treino > RETREINO_SEG:
+                print("Treinando modelo...")
+                est = treinar()
+                t_treino = time.time()
+                print(f"  acc={est['acc']:.1%} auc={est['auc']:.3f} sharpe={est['sharpe']:.2f}")
+
+            hist = indicadores(baixar(ATIVO, "1y"))
+            live = baixar(ATIVO, "1d", INTERVALO_LIVE)
+            prob = prever(est["modelo"], hist[["Open", "High", "Low", "Close", "Volume"]])
+            desenhar(fig, ax, hist, live, prob, est)
+            registrar(prob, float(hist["Close"].iloc[-1]))
+            print(f"[{datetime.now():%H:%M:%S}] P(alta)={prob:.1%}")
+        except Exception as e:  # rede fora, mercado fechado etc.
+            print(f"Falha na atualização: {e}")
+        plt.pause(REFRESH_SEG)  # mantém a janela responsiva
+
+
+if __name__ == "__main__":
+    executar()
+
